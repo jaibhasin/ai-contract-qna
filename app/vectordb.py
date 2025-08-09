@@ -45,7 +45,7 @@ class VectorStore:
             ],
             'medium_priority': [
                 'deductible', 'copay', 'network', 'benefit', 'rider',
-                'policy holder', 'beneficiary', 'ayush', 'room rent'
+                'policy holder', 'beneficiary', 'room rent'
             ],
             'time_indicators': [
                 'days', 'months', 'years', 'period', 'duration'
@@ -82,6 +82,40 @@ class VectorStore:
             self._mmr_lambda: float = float(read_env("MMR_LAMBDA", "0.5") or "0.5")
         except Exception:
             self._mmr_lambda = 0.5
+
+        # Lexical augmentation toggles
+        try:
+            self._enable_lexical: bool = (read_env("ENABLE_LEXICAL_AUGMENT", "true").lower() == "true")
+        except Exception:
+            self._enable_lexical = True
+        try:
+            self._lexical_max_add: int = int(read_env("LEXICAL_MAX_ADD", "10") or "10")
+        except Exception:
+            self._lexical_max_add = 10
+
+        # Domain synonyms for robust recall (keep lightweight and general)
+        self._synonyms: Dict[str, set] = {
+            "coverage": {"coverage", "covered", "cover", "benefit", "benefits"},
+            "sum insured": {"sum insured", "si", "insured sum", "insured amount", "coverage limit"},
+            "waiting period": {"waiting period", "waiting", "cooling period"},
+            "grace period": {"grace period", "grace", "payment grace"},
+            "co-payment": {"co-payment", "copay", "co pay", "co-payment percentage"},
+            "room rent": {"room rent", "room charges", "room limit"},
+            "pre-existing": {"pre-existing", "preexisting", "pre existing"},
+        }
+
+    def _extract_key_phrases(self, query_lower: str) -> List[str]:
+        """Extract key n-gram phrases from query for exact matching.
+        Uses 2- to 4-grams to avoid overly generic unigrams.
+        """
+        tokens = [t for t in query_lower.split() if len(t) > 1]
+        phrases: List[str] = []
+        for n in (4, 3, 2):
+            for i in range(max(0, len(tokens) - n + 1)):
+                phrase = " ".join(tokens[i:i+n])
+                if len(phrase) >= 3:
+                    phrases.append(phrase)
+        return phrases
 
     def upsert_documents(self, chunks: List[Chunk], emb: EmbeddingClient) -> None:
         if not chunks:
@@ -237,6 +271,42 @@ class VectorStore:
         enhanced_results = []
         query_lower = query_text.lower()
         query_terms = set(query_lower.split())
+        key_phrases = self._extract_key_phrases(query_lower)
+
+        # Optional lexical augmentation: ensure chunks with exact phrases/synonyms
+        # are considered even if vector similarity missed them. This helps diverse
+        # queries where exact terminology appears (e.g., AYUSH expansions).
+        if self._enable_lexical and self._records:
+            seen_ids = {rec.id for rec, _ in filtered_results}
+            lexical_candidates: List[Tuple[VectorRecord, float]] = []
+
+            # Build a small set of synonym terms relevant to the query
+            synonym_terms: set = set()
+            for key, vals in self._synonyms.items():
+                if key in query_lower or any(v in query_lower for v in vals):
+                    synonym_terms.update(vals)
+
+            # Scan all records for phrase/synonym hits (O(N) but N is modest)
+            for rec in self._records:
+                if rec.id in seen_ids:
+                    continue
+                text_lower = rec.metadata.get('text', '').lower()
+
+                phrase_hits = sum(1 for p in key_phrases if p in text_lower)
+                syn_hits = 0
+                if synonym_terms:
+                    syn_hits = sum(1 for s in synonym_terms if s in text_lower)
+
+                if phrase_hits > 0 or syn_hits > 0:
+                    # fabricate a conservative base score to be refined by boosting/MMR
+                    base = 0.18 + 0.04 * phrase_hits + 0.03 * syn_hits
+                    lexical_candidates.append((rec, min(0.6, base)))
+
+            # Keep only top-K lexical candidates and merge
+            if lexical_candidates:
+                lexical_candidates.sort(key=lambda x: x[1], reverse=True)
+                to_add = lexical_candidates[: self._lexical_max_add]
+                filtered_results = (to_add + filtered_results)[: max(self._filtered_keep, k * 4)]
         
         for record, base_score in filtered_results:
             text_lower = record.metadata['text'].lower()
@@ -270,11 +340,11 @@ class VectorStore:
                     boost_reasons.append("percentages")
             
             # 4. Exact phrase matching
-            key_phrases = [
+            key_phrases_local = [
                 'grace period', 'waiting period', 'pre-existing', 'maternity',
-                'room rent', 'sum insured', 'no claim', 'ayush'
+                'room rent', 'sum insured', 'no claim'
             ]
-            for phrase in key_phrases:
+            for phrase in key_phrases_local:
                 if phrase in query_lower and phrase in text_lower:
                     enhanced_score += boost_factors['exact_match']
                     boost_reasons.append(f"exact_match({phrase})")
