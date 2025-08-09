@@ -54,6 +54,34 @@ class VectorStore:
         
         logger.info("VectorStore using FAISS (cosine via inner product on normalized vectors)")
         logger.info("Enhanced with insurance-specific search capabilities")
+        
+        # Retrieval behavior controlled via environment
+        try:
+            self._use_ce_rerank: bool = (read_env("CROSS_ENCODER_RERANK", "false").lower() == "true")
+        except Exception:
+            self._use_ce_rerank = False
+        
+        # Size of initial candidate pool
+        try:
+            self._initial_k_min: int = int(read_env("INITIAL_CANDIDATES_MIN", "80") or "80")
+        except Exception:
+            self._initial_k_min = 80
+        try:
+            self._initial_k_mult: int = int(read_env("INITIAL_CANDIDATES_MULT", "8") or "8")
+        except Exception:
+            self._initial_k_mult = 8
+        
+        # How many to keep after early filtering
+        try:
+            self._filtered_keep: int = int(read_env("FILTERED_KEEP", "50") or "50")
+        except Exception:
+            self._filtered_keep = 50
+        
+        # MMR diversity strength (0..1)
+        try:
+            self._mmr_lambda: float = float(read_env("MMR_LAMBDA", "0.5") or "0.5")
+        except Exception:
+            self._mmr_lambda = 0.5
 
     def upsert_documents(self, chunks: List[Chunk], emb: EmbeddingClient) -> None:
         if not chunks:
@@ -162,8 +190,8 @@ class VectorStore:
         self, 
         query_embedding: np.ndarray, 
         query_text: str,
-        k: int = 12,  # Increased default for better coverage
-        min_score: float = 0.25,
+        k: int = 20,  # prioritize accuracy: fetch more final results
+        min_score: float = 0.15,  # relax threshold to avoid dropping potentially relevant chunks
         boost_factors: Optional[Dict[str, float]] = None
     ) -> List[Tuple[VectorRecord, float]]:
         """Enhanced search optimized for insurance document queries.
@@ -193,26 +221,17 @@ class VectorStore:
                 'doc_type_insurance': 0.10
             }
 
-        # Get initial candidates (retrieve more for better filtering)
-        initial_k = min(k * 3, len(self._records))
+        # Get a larger initial candidate pool to maximize recall.
+        # We will apply MMR and optional reranking later to improve precision.
+        initial_k = min(max(self._initial_k_min, k * self._initial_k_mult), len(self._records))
         initial_results = self.search(query_embedding, k=initial_k)
         
         if not initial_results:
             return []
         
-        # Apply minimum score filtering
-        filtered_results = [
-            (record, score) for record, score in initial_results 
-            if score >= min_score
-        ]
-        
-        if not filtered_results:
-            logger.warning(f"No results above minimum score {min_score}")
-            # Lower the threshold and try again
-            filtered_results = [
-                (record, score) for record, score in initial_results 
-                if score >= min_score * 0.7
-            ][:k*2]  # Take top candidates even if below threshold
+        # Avoid aggressive minimum score filtering upfront to preserve recall.
+        # Instead, keep top-N by base similarity and let boosting/MMR refine later.
+        filtered_results = initial_results[: max(self._filtered_keep, k * 4)]
 
         # Enhanced scoring with insurance-specific boosting
         enhanced_results = []
@@ -283,12 +302,42 @@ class VectorStore:
         
         # Sort by enhanced score
         enhanced_results.sort(key=lambda x: x[1], reverse=True)
-        
-        # Apply diversity filtering to avoid too many chunks from the same page
-        diverse_results = self._apply_diversity_filter(enhanced_results, k)
-        
-        logger.info(f"Insurance search: {len(initial_results)} initial -> {len(filtered_results)} filtered -> {len(diverse_results)} final")
-        return diverse_results
+
+        # Apply MMR (Maximal Marginal Relevance) to balance relevance and diversity
+        # Use vectors for MMR similarity; fall back to diversity filter if anything fails
+        try:
+            selected_mmr = self._mmr_select(
+                query_vec=np.asarray(query_embedding, dtype=np.float32),
+                candidates=enhanced_results,
+                top_k=max(k * 2, 30),  # pick a bit more for optional reranker
+                lambda_diversity=self._mmr_lambda,
+            )
+        except Exception as e:
+            logger.warning(f"MMR selection failed, falling back to diversity filter: {e}")
+            selected_mmr = self._apply_diversity_filter(enhanced_results, max(k * 2, 30))
+
+        # Optional cross-encoder reranking for maximum accuracy (if dependency available)
+        reranked = selected_mmr
+        if self._use_ce_rerank:
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+
+                ce_model_name = read_env("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                ce = CrossEncoder(ce_model_name)
+                pairs = [(query_text, rec.metadata["text"]) for rec, _ in reranked]
+                ce_scores = ce.predict(pairs)
+                reranked = list(zip([r for r, _ in reranked], [float(s) for s in ce_scores]))
+                reranked.sort(key=lambda x: x[1], reverse=True)
+                logger.info("Applied cross-encoder reranking for improved precision")
+            except Exception as e:
+                # Dependency not available or failed; proceed with MMR-selected enhanced scores
+                logger.debug(f"Cross-encoder rerank skipped: {e}")
+
+        final_results = reranked[:k]
+        logger.info(
+            f"Insurance search: {len(initial_results)} initial -> {len(filtered_results)} filtered -> {len(enhanced_results)} enhanced -> {len(final_results)} final"
+        )
+        return final_results
 
     def _apply_diversity_filter(
         self, 
@@ -333,6 +382,66 @@ class VectorStore:
         # Final sort and trim
         final_results.sort(key=lambda x: x[1], reverse=True)
         return final_results[:target_k]
+
+    def _mmr_select(
+        self,
+        query_vec: np.ndarray,
+        candidates: List[Tuple[VectorRecord, float]],
+        top_k: int,
+        lambda_diversity: float = 0.5,
+    ) -> List[Tuple[VectorRecord, float]]:
+        """Maximal Marginal Relevance selection over candidate chunks.
+
+        Args:
+            query_vec: Normalized query embedding (1D or 2D).
+            candidates: List of (record, score) with scores assumed in [0, 1].
+            top_k: Number of items to select.
+            lambda_diversity: Trade-off between relevance and diversity (0..1).
+
+        Returns:
+            Selected list of (record, score) preserving input score scale.
+        """
+        if not candidates:
+            return []
+
+        # Ensure shapes and normalization
+        q = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
+        q = q / (np.linalg.norm(q) + 1e-8)
+
+        # Precompute candidate matrix and their base scores
+        cand_vecs = np.vstack([rec.vector for rec, _ in candidates]).astype(np.float32)
+        cand_vecs = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-8)
+        base_scores = np.array([score for _, score in candidates], dtype=np.float32)
+
+        # Cosine similarity of candidates to query (redundant but robust)
+        rel = (cand_vecs @ q.T).reshape(-1)
+        # Start with the best by relevance to query to seed the set
+        selected_idx: List[int] = []
+        remaining = list(range(len(candidates)))
+
+        # Pick the most relevant first
+        first = int(np.argmax(rel))
+        selected_idx.append(first)
+        remaining.remove(first)
+
+        # Iteratively add items maximizing MMR criterion
+        while remaining and len(selected_idx) < min(top_k, len(candidates)):
+            # Diversity term: max similarity to already selected
+            selected_mat = cand_vecs[selected_idx]
+            # For efficiency compute similarities in batches
+            sim_to_selected = selected_mat @ cand_vecs[remaining].T  # (|S|, |R|)
+            max_sim = sim_to_selected.max(axis=0)  # (|R|,)
+
+            # Combine relevance and diversity
+            mmr_scores = lambda_diversity * rel[remaining] - (1.0 - lambda_diversity) * max_sim
+            next_idx_in_remaining = int(np.argmax(mmr_scores))
+            next_global_idx = remaining[next_idx_in_remaining]
+
+            selected_idx.append(next_global_idx)
+            remaining.remove(next_global_idx)
+
+        # Preserve original enhanced/base scores for downstream consumers
+        return [candidates[i] for i in selected_idx]
 
     def get_chunk_context(
         self, 
