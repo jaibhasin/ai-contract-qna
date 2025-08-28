@@ -105,4 +105,4 @@ Tip: Use `file:///C:/...` and URL-encode spaces as `%20`.
 - `app/` contains modules: ingestion, chunking, embeddings, vectordb, retriever, matcher, reasoner, models, utils, main
 - `tests/` includes unit/integration tests
 - `design.md` summarizes architecture and cost considerations
-
+-
